@@ -20,10 +20,12 @@ func TestLoadGenerator_SingleSpec(t *testing.T) {
 	}
 
 	gen := NewLoadGenerator(specs)
-	var events []*LoadEvent
+	var events []LoadEvent
 
-	for event := gen.Next(); event != nil; event = gen.Next() {
+	event, ok := gen.Next()
+	for ok {
 		events = append(events, event)
+		event, ok = gen.Next()
 	}
 
 	if len(events) == 0 {
@@ -32,7 +34,7 @@ func TestLoadGenerator_SingleSpec(t *testing.T) {
 
 	// Verify timestamps are monotonically increasing
 	for i := 1; i < len(events); i++ {
-		if events[i].Timestamp.Before(events[i-1].Timestamp) {
+		if events[i].Timestamp < events[i-1].Timestamp {
 			t.Errorf("Timestamps not monotonic at index %d", i)
 		}
 	}
@@ -59,10 +61,12 @@ func TestLoadGenerator_MultipleSpecs(t *testing.T) {
 	}
 
 	gen := NewLoadGenerator(specs)
-	var events []*LoadEvent
+	var events []LoadEvent
 
-	for event := gen.Next(); event != nil; event = gen.Next() {
+	event, ok := gen.Next()
+	for ok {
 		events = append(events, event)
+		event, ok = gen.Next()
 	}
 
 	if len(events) == 0 {
@@ -71,7 +75,7 @@ func TestLoadGenerator_MultipleSpecs(t *testing.T) {
 
 	// Verify timestamps are monotonically increasing across spec boundaries
 	for i := 1; i < len(events); i++ {
-		if events[i].Timestamp.Before(events[i-1].Timestamp) {
+		if events[i].Timestamp < events[i-1].Timestamp {
 			t.Errorf("Timestamps not monotonic across specs at index %d", i)
 		}
 	}
@@ -93,9 +97,11 @@ func TestLoadGenerator_P50Accuracy(t *testing.T) {
 	var durations []float64
 
 	count := 0
-	for event := gen.Next(); event != nil && count < 1000; event = gen.Next() {
-		durations = append(durations, float64(event.Duration.Milliseconds()))
+	event, ok := gen.Next()
+	for ok && count < 1000 {
+		durations = append(durations, float64(event.Duration)/1e6)
 		count++
+		event, ok = gen.Next()
 	}
 
 	if len(durations) < 500 {
@@ -130,13 +136,15 @@ func TestLoadGenerator_ErrorRate(t *testing.T) {
 	var successCount, failureCount int
 
 	count := 0
-	for event := gen.Next(); event != nil && count < 1000; event = gen.Next() {
+	event, ok := gen.Next()
+	for ok && count < 1000 {
 		if event.Success {
 			successCount++
 		} else {
 			failureCount++
 		}
 		count++
+		event, ok = gen.Next()
 	}
 
 	actualErrorRate := float64(failureCount) / float64(successCount+failureCount)
@@ -166,11 +174,13 @@ func TestLoadGenerator_TimeoutFailures(t *testing.T) {
 	var timeoutFailures int
 
 	count := 0
-	for event := gen.Next(); event != nil && count < 1000; event = gen.Next() {
-		if !event.Success && float64(event.Duration.Milliseconds()) > specs[0].TimeoutMS {
+	event, ok := gen.Next()
+	for ok && count < 1000 {
+		if !event.Success && float64(event.Duration)/1e6 > specs[0].TimeoutMS {
 			timeoutFailures++
 		}
 		count++
+		event, ok = gen.Next()
 	}
 
 	// With timeout slightly above p99, we expect some (but not many) timeouts
@@ -196,13 +206,17 @@ func TestEventStream_StartEndPairing(t *testing.T) {
 	stream := NewEventStream(gen)
 
 	var startCount, endCount int
-	var events []*SimEvent
+	var events []SimEvent
 
-	for event := stream.Next(); event != nil; event = stream.Next() {
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
 		events = append(events, event)
-		if event.Type == EventStart {
+		if event.Status == EventStart {
 			startCount++
-		} else if event.Type == EventEnd {
+		} else {
 			endCount++
 		}
 	}
@@ -243,7 +257,11 @@ func TestEventStream_TimestampMonotonicity(t *testing.T) {
 	var prevTime time.Time
 	count := 0
 
-	for event := stream.Next(); event != nil && count < 100; event = stream.Next() {
+	for count < 100 {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
 		if !prevTime.IsZero() && event.Timestamp.Before(prevTime) {
 			t.Errorf("Timestamp went backwards: %v -> %v", prevTime, event.Timestamp)
 		}
@@ -282,13 +300,17 @@ func TestEventStream_MultipleSpecs(t *testing.T) {
 	var startCount, endCount int
 	var prevTime time.Time
 
-	for event := stream.Next(); event != nil; event = stream.Next() {
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
 		if !prevTime.IsZero() && event.Timestamp.Before(prevTime) {
 			t.Errorf("Timestamp not monotonic across spec boundary")
 		}
 		prevTime = event.Timestamp
 
-		if event.Type == EventStart {
+		if event.Status == EventStart {
 			startCount++
 		} else {
 			endCount++
@@ -300,21 +322,21 @@ func TestEventStream_MultipleSpecs(t *testing.T) {
 	}
 }
 
-func TestEventType_String(t *testing.T) {
+func TestEventStatus_String(t *testing.T) {
 	tests := []struct {
-		eventType EventType
-		expected  string
+		eventStatus EventStatus
+		expected    string
 	}{
 		{EventStart, "start"},
-		{EventEnd, "end"},
-		{EventType(999), "unknown"},
+		{EventSuccess, "success"},
+		{EventError, "error"},
 	}
 
 	for _, tt := range tests {
-		result := tt.eventType.String()
+		result := tt.eventStatus.String()
 		if result != tt.expected {
-			t.Errorf("EventType(%d).String() = %s, expected %s",
-				tt.eventType, result, tt.expected)
+			t.Errorf("EventStatus(%d).String() = %s, expected %s",
+				tt.eventStatus, result, tt.expected)
 		}
 	}
 }
@@ -350,7 +372,7 @@ func TestLoadGenerator_ZeroRPM(t *testing.T) {
 	}()
 
 	gen := NewLoadGenerator(specs)
-	_ = gen.Next()
+	_, _ = gen.Next()
 }
 
 func TestLoadGenerator_ValidationP50P99(t *testing.T) {
@@ -422,8 +444,10 @@ func BenchmarkLoadGenerator(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		gen := NewLoadGenerator(specs)
 		count := 0
-		for event := gen.Next(); event != nil && count < 1000; event = gen.Next() {
+		_, ok := gen.Next()
+		for ok && count < 1000 {
 			count++
+			_, ok = gen.Next()
 		}
 	}
 }
@@ -445,7 +469,11 @@ func BenchmarkEventStream(b *testing.B) {
 		gen := NewLoadGenerator(specs)
 		stream := NewEventStream(gen)
 		count := 0
-		for event := stream.Next(); event != nil && count < 1000; event = stream.Next() {
+		for count < 1000 {
+			_, err := stream.Next()
+			if err != nil {
+				break
+			}
 			count++
 		}
 	}

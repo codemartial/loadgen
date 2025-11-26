@@ -56,10 +56,10 @@ func BenchmarkWeeklyTraffic(b *testing.B) {
 	eventCount := int64(0)
 
 	b.ResetTimer()
-	event := gen.Next()
+	_, err := gen.Next()
 	//	for i := 0; i < b.N && event != nil; i++ {
-	for event != nil {
-		event = gen.Next()
+	for err == nil {
+		_, err = gen.Next()
 		eventCount++
 	}
 	b.StopTimer()
