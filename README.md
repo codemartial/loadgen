@@ -139,4 +139,4 @@ MIT. Do what you want with it.
 
 Written because existing load testing tools were either too slow, too complex, or required actual network operations.
 
-Inspired by the realization that if you don't need actual HTTP, you shouldn't pay for it.
+Built for testing [levee](https://github.com/codemartial/levee).
