@@ -427,6 +427,199 @@ func percentile(sorted []float64, p int) float64 {
 	return sorted[idx]
 }
 
+// TestEventStream_StartEventsAlwaysEventStart verifies that start events
+// always have EventStart status, regardless of whether the task will succeed or fail.
+// Uses EventID to match start events with their completions.
+func TestEventStream_StartEventsAlwaysEventStart(t *testing.T) {
+	specs := []LoadSpec{
+		{
+			RPM:          600,
+			ErrorRate:    0.50, // 50% error rate to ensure we get failures
+			DurationS:    5,
+			P50LatencyMS: 50,
+			P99LatencyMS: 100,
+			TimeoutMS:    500,
+		},
+	}
+
+	gen := NewLoadGenerator(specs)
+	stream := NewEventStream(gen)
+
+	// Track events by EventID
+	eventsByID := make(map[int64][]SimEvent)
+
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
+		eventsByID[event.EventID] = append(eventsByID[event.EventID], event)
+	}
+
+	if len(eventsByID) < 2 {
+		t.Fatalf("Not enough events generated: %d unique IDs", len(eventsByID))
+	}
+
+	// For each EventID, verify the first occurrence is EventStart
+	for id, events := range eventsByID {
+		if len(events) == 0 {
+			continue
+		}
+
+		// First event with this ID should be EventStart
+		if events[0].Status != EventStart {
+			t.Errorf("EventID %d: first event has status %v, expected EventStart", id, events[0].Status)
+		}
+
+		// If there's a second event (completion), it should be Success or Error
+		if len(events) > 1 {
+			if events[1].Status != EventSuccess && events[1].Status != EventError {
+				t.Errorf("EventID %d: completion event has status %v, expected EventSuccess or EventError", id, events[1].Status)
+			}
+		}
+
+		// Should never have more than 2 events per ID
+		if len(events) > 2 {
+			t.Errorf("EventID %d: has %d events, expected at most 2 (start + completion)", id, len(events))
+		}
+	}
+}
+
+// TestEventStream_CompletionEventsReflectSuccess verifies that completion events
+// properly reflect whether the task succeeded or failed.
+// Uses low RPM to get alternating start/completion pattern, then checks later events (completions).
+func TestEventStream_CompletionEventsReflectSuccess(t *testing.T) {
+	specs := []LoadSpec{
+		{
+			RPM:          60,   // 1 request per second - ensures alternation
+			ErrorRate:    0.50, // 50% error rate
+			DurationS:    10,
+			P50LatencyMS: 50,
+			P99LatencyMS: 100,
+			TimeoutMS:    500,
+		},
+	}
+
+	gen := NewLoadGenerator(specs)
+	stream := NewEventStream(gen)
+
+	var events []SimEvent
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
+		events = append(events, event)
+	}
+
+	if len(events) < 10 {
+		t.Fatalf("Not enough events generated: %d", len(events))
+	}
+
+	// With low RPM, events alternate: start, completion, start, completion, ...
+	// Odd-indexed events (1, 3, 5, ...) are completions (later timestamps)
+	var successCompletions, errorCompletions int
+	for i := 1; i < len(events); i += 2 {
+		// Verify this is indeed a completion (later timestamp than previous)
+		if !events[i].Timestamp.After(events[i-1].Timestamp) &&
+		   !events[i].Timestamp.Equal(events[i-1].Timestamp) {
+			continue // Skip if not the expected pattern
+		}
+
+		// Count completion event statuses
+		switch events[i].Status {
+		case EventSuccess:
+			successCompletions++
+		case EventError:
+			errorCompletions++
+		}
+	}
+
+	// With 50% error rate, we should see BOTH success and error completions
+	if errorCompletions == 0 {
+		t.Errorf("Expected some error completion events with 50%% error rate, got 0 (success=%d)", successCompletions)
+	}
+
+	if successCompletions == 0 {
+		t.Errorf("Expected some success completion events with 50%% error rate, got 0 (error=%d)", errorCompletions)
+	}
+
+	// Sanity check: with 50% error rate, distribution should be reasonable
+	totalCompletions := successCompletions + errorCompletions
+	if totalCompletions > 0 {
+		errorRate := float64(errorCompletions) / float64(totalCompletions)
+		// Very loose bounds - just checking both types exist
+		if errorRate < 0.1 || errorRate > 0.9 {
+			t.Errorf("Error rate among completions is %.2f%%, expected roughly 50%%", errorRate*100)
+		}
+	}
+}
+
+// TestEventStream_ErrorTaskLifecycle verifies the complete lifecycle of a failed task:
+// it should emit EventStart when starting, then EventError when completing
+func TestEventStream_ErrorTaskLifecycle(t *testing.T) {
+	specs := []LoadSpec{
+		{
+			RPM:          60,
+			ErrorRate:    1.0, // 100% error rate - all tasks fail
+			DurationS:    2,
+			P50LatencyMS: 50,
+			P99LatencyMS: 100,
+			TimeoutMS:    500,
+		},
+	}
+
+	gen := NewLoadGenerator(specs)
+	stream := NewEventStream(gen)
+
+	var events []SimEvent
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
+		events = append(events, event)
+	}
+
+	if len(events) == 0 {
+		t.Fatal("No events generated")
+	}
+
+	// Count event types
+	var startCount, errorCount, successCount int
+	for _, event := range events {
+		switch event.Status {
+		case EventStart:
+			startCount++
+		case EventError:
+			errorCount++
+		case EventSuccess:
+			successCount++
+		}
+	}
+
+	// With 100% error rate:
+	// - All start events should be EventStart
+	// - All completion events should be EventError
+	// - No completion events should be EventSuccess
+	if startCount == 0 {
+		t.Error("Expected start events")
+	}
+
+	if errorCount == 0 {
+		t.Error("Expected error completion events with 100% error rate")
+	}
+
+	if successCount > 0 {
+		t.Errorf("Expected no success completions with 100%% error rate, got %d", successCount)
+	}
+
+	// Start and completion counts should match
+	if startCount != errorCount {
+		t.Errorf("Start count %d should equal error completion count %d", startCount, errorCount)
+	}
+}
+
 // Benchmark tests
 func BenchmarkLoadGenerator(b *testing.B) {
 	specs := []LoadSpec{

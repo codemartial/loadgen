@@ -135,16 +135,19 @@ func (lg *LoadGenerator) Next() (LoadEvent, bool) {
 	// Generate response duration using power-law distribution
 	x := lg.rng.Float64()
 	t_delta := lg.scale * (1 + math.Exp(lg.k*(math.Log(x)-logHalf)))
-	duration := int64(t_delta * 1e6) // Convert milliseconds to nanoseconds
 
-	// Determine success: false if duration > timeout OR random error
-	success := true
-	timeout := int64(spec.TimeoutMS * 1e6)
-	if duration > timeout {
-		success = false
-	} else if lg.rng.Float64() < spec.ErrorRate {
-		success = false
+	// Determine success based on error rate
+	success := lg.rng.Float64() >= spec.ErrorRate
+
+	// Clamp successful requests below timeout (0.99 for float safety margin)
+	if success {
+		safeTimeout := 0.99 * spec.TimeoutMS
+		if t_delta > safeTimeout {
+			t_delta = safeTimeout
+		}
 	}
+
+	duration := int64(t_delta * 1e6) // Convert milliseconds to nanoseconds
 
 	return LoadEvent{
 		Timestamp: timestamp,
@@ -178,35 +181,34 @@ func (e EventStatus) String() string {
 
 // SimEvent represents a discrete simulation event with timestamp and status
 type SimEvent struct {
+	EventID   int64
 	Timestamp time.Time
 	Status    EventStatus
 }
 
-// timeHeap implements heap.Interface for int64 nanoseconds (min-heap)
-type timeHeap []int64
-
-func (h timeHeap) Len() int           { return len(h) }
-func (h timeHeap) Less(i, j int) bool { return h[i] < h[j] }
-func (h timeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
-func (h *timeHeap) Push(x interface{}) {
-	*h = append(*h, x.(int64))
+type pendingEvent struct {
+	seq    int64
+	ts     int64
+	status EventStatus
 }
 
-func (h *timeHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+// eventHeap implements heap.Interface for pendingEvent (min-heap)
+type eventHeap []pendingEvent
+
+func (h eventHeap) Len() int           { return len(h) }
+func (h eventHeap) Less(i, j int) bool { return h[i].ts < h[j].ts }
+func (h eventHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *eventHeap) Push(x interface{}) {
+	*h = append(*h, x.(pendingEvent))
 }
 
-func (h timeHeap) Peek() int64 {
+func (h eventHeap) Peek() pendingEvent {
 	return h[0]
 }
 
 // PopInt64 removes and returns the minimum element without interface boxing
-func (h *timeHeap) PopInt64() int64 {
+func (h *eventHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	x := old[0]
@@ -219,7 +221,7 @@ func (h *timeHeap) PopInt64() int64 {
 }
 
 // down implements the heap down operation
-func down(h *timeHeap, i0, n int) bool {
+func down(h *eventHeap, i0, n int) bool {
 	i := i0
 	for {
 		j1 := 2*i + 1
@@ -227,10 +229,10 @@ func down(h *timeHeap, i0, n int) bool {
 			break
 		}
 		j := j1
-		if j2 := j1 + 1; j2 < n && (*h)[j2] < (*h)[j1] {
+		if j2 := j1 + 1; j2 < n && (*h)[j2].ts < (*h)[j1].ts {
 			j = j2
 		}
-		if (*h)[i] <= (*h)[j] {
+		if (*h)[i].ts <= (*h)[j].ts {
 			break
 		}
 		(*h)[i], (*h)[j] = (*h)[j], (*h)[i]
@@ -243,10 +245,11 @@ func down(h *timeHeap, i0, n int) bool {
 type EventStream struct {
 	gen         *LoadGenerator
 	currentTime int64 // Unix nanoseconds
-	activeTasks *timeHeap
+	activeTasks *eventHeap
 	peekedEvent LoadEvent
 	hasPeeked   bool
 	initialized bool
+	eventCount  int64
 }
 
 // NewEventStream creates a new event stream from a load generator
@@ -263,7 +266,7 @@ func NewEventStream(gen *LoadGenerator) *EventStream {
 	}
 
 	// Preallocate heap with calculated capacity
-	h := make(timeHeap, 0, maxConcurrent)
+	h := make(eventHeap, 0, maxConcurrent)
 	heap.Init(&h)
 
 	return &EventStream{
@@ -282,11 +285,12 @@ func (es *EventStream) Next() (SimEvent, error) {
 
 	for {
 		// 1. Expire all tasks that have finished by now
-		for es.activeTasks.Len() > 0 && es.activeTasks.Peek() <= es.currentTime {
-			es.activeTasks.PopInt64()
+		for es.activeTasks.Len() > 0 && es.activeTasks.Peek().ts <= es.currentTime {
+			t := es.activeTasks.Pop().(pendingEvent)
 			return SimEvent{
-				Timestamp: time.Unix(0, es.currentTime),
-				Status:    EventSuccess,
+				EventID:   t.seq,
+				Timestamp: time.Unix(0, int64(t.ts)),
+				Status:    t.status,
 			}, nil
 		}
 
@@ -301,7 +305,7 @@ func (es *EventStream) Next() (SimEvent, error) {
 					return SimEvent{}, errors.New("done")
 				}
 				// Jump to next expiry
-				es.currentTime = es.activeTasks.Peek()
+				es.currentTime = es.activeTasks.Peek().ts
 				continue
 			}
 			es.hasPeeked = true
@@ -310,12 +314,7 @@ func (es *EventStream) Next() (SimEvent, error) {
 
 		var nextEventTime int64
 		if es.activeTasks.Len() > 0 {
-			nextExpiry := es.activeTasks.Peek()
-			if nextTaskTime < nextExpiry {
-				nextEventTime = nextTaskTime
-			} else {
-				nextEventTime = nextExpiry
-			}
+			nextEventTime = min(es.activeTasks.Peek().ts, nextTaskTime)
 		} else {
 			nextEventTime = nextTaskTime
 		}
@@ -330,18 +329,18 @@ func (es *EventStream) Next() (SimEvent, error) {
 
 			// Calculate end time as int64
 			endTime := task.Timestamp + task.Duration
-			heap.Push(es.activeTasks, endTime)
-
-			// Determine status
-			status := EventStart
-			if !task.Success {
-				status = EventError
+			es.eventCount += 1
+			status := EventError
+			if task.Success {
+				status = EventSuccess
 			}
+			heap.Push(es.activeTasks, pendingEvent{es.eventCount, endTime, status})
 
 			// Yield start event (convert to time.Time only here)
 			result := SimEvent{
+				EventID:   es.eventCount,
 				Timestamp: time.Unix(0, task.Timestamp),
-				Status:    status,
+				Status:    EventStart,
 			}
 
 			// Peek next task for next iteration
