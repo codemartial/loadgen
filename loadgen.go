@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"time"
 )
 
@@ -97,7 +97,7 @@ func NewLoadGenerator(specs []LoadSpec) *LoadGenerator {
 		nextEvent:   startNano,
 		specStart:   startNano,
 		startTime:   startTime,
-		rng:         rand.New(rand.NewSource(now.UnixNano())),
+		rng:         rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(now.UnixNano()>>32))),
 		k:           math.Log(2*p99/p50-1) / math.Log(0.99/0.5),
 		scale:       0.5 * p50,
 	}
@@ -129,7 +129,7 @@ func (lg *LoadGenerator) Next() (LoadEvent, bool) {
 
 	// Calculate inter-arrival time based on RPM (exponential distribution)
 	interArrival := (60.0 * 1e9) / float64(spec.RPM)
-	nextInterval := -math.Log(lg.rng.Float64()) * interArrival
+	nextInterval := lg.rng.ExpFloat64() * interArrival
 	lg.nextEvent += int64(nextInterval)
 
 	// Generate response duration using power-law distribution
@@ -207,8 +207,17 @@ func (h eventHeap) Peek() pendingEvent {
 	return h[0]
 }
 
-// PopInt64 removes and returns the minimum element without interface boxing
+// Pop removes and returns the minimum element (for heap.Interface compatibility)
 func (h *eventHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// PopEvent removes and returns the minimum element without interface boxing
+func (h *eventHeap) PopEvent() pendingEvent {
 	old := *h
 	n := len(old)
 	x := old[0]
@@ -286,7 +295,7 @@ func (es *EventStream) Next() (SimEvent, error) {
 	for {
 		// 1. Expire all tasks that have finished by now
 		for es.activeTasks.Len() > 0 && es.activeTasks.Peek().ts <= es.currentTime {
-			t := es.activeTasks.Pop().(pendingEvent)
+			t := es.activeTasks.PopEvent()
 			return SimEvent{
 				EventID:   t.seq,
 				Timestamp: time.Unix(0, int64(t.ts)),
