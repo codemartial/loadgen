@@ -10,12 +10,12 @@ loadgen generates synthetic load events with realistic statistical properties. N
 
 ## Features
 
-- **Statistical realism**: Power-law latency distributions matching real p50/p99 targets
+- **Statistical realism**: Rational function latency distributions with heavy tails matching real p50/p99 targets
 - **Multiple load phases**: Model daily traffic patterns with different specs
 - **Error injection**: Configurable error rates and timeout failures
 - **Zero clock dependency**: Simulated time means tests run at CPU speed, not wall-clock speed
-- **Memory efficient**: 4 bytes and 0.5 allocations per event after optimization
-- **Fast**: Generates 11+ million events per second on commodity hardware
+- **Memory efficient**: 12 bytes and 0.5 allocations per event
+- **Fast**: Generates 15+ million events per second on commodity hardware
 
 ## Installation
 
@@ -71,9 +71,11 @@ func main() {
 ### Load Generator
 
 The `LoadGenerator` creates individual load events using:
-- Exponential distribution for inter-arrival times (realistic request spacing)
-- Power-law distribution for response durations (matches real latency profiles)
-- Configurable error injection (random errors + timeout-based failures)
+- **Exponential distribution** for inter-arrival times (Poisson arrival process - realistic request spacing)
+- **Piecewise rational function** for response durations:
+  - Main distribution (x ≤ 0.99): `y = a + b*x/(1-c*x)` - fits p50/2, p50, and p99 exactly
+  - Heavy tail (x > 0.99): Linear interpolation from p99 to timeout - models extreme latencies
+- **Configurable error injection** (random errors + timeout-based failures)
 
 Each event emits a Unix nanosecond timestamp, response duration, and success/error status. These are raw load events - just data points saying "a request started at time T and took D nanoseconds."
 
@@ -87,7 +89,7 @@ The `EventStream` converts those raw load events into discrete start/success/err
 
 This gives you the full picture of system load over time, not just individual requests.
 
-Note: The stream doesn't currently track which end event corresponds to which start event yet. If you need this functionality, contributions are welcome. (It's not that difficult, TBH).
+The stream tracks event IDs, so each start event can be matched with its corresponding completion event via the `EventID` field.
 
 ## Typical Use Cases
 
@@ -124,12 +126,12 @@ specs := []loadgen.LoadSpec{
 ## Performance Characteristics
 
 Benchmarked on a week-long traffic simulation (604M events):
-- Throughput: 11.5M events/sec
-- Memory per event: 4 bytes
-- Allocations per event: 0.5
-- Total runtime: 52 seconds for 604M events
+- **Throughput**: 15.1M events/sec
+- **Memory per event**: 12 bytes
+- **Allocations per event**: 0.5
+- **Total runtime**: 40 seconds for 604M events
 
-The generator is CPU-bound by mathematical operations (log/exp), not memory allocation.
+The generator is compute-bound by basic arithmetic operations, not memory allocation.
 
 ## License
 

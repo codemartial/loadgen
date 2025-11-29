@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"time"
 )
@@ -52,14 +51,14 @@ type LoadEvent struct {
 
 // LoadGenerator generates synthetic load events based on LoadSpecs
 type LoadGenerator struct {
-	specs       []LoadSpec
-	currentSpec int
-	nextEvent   int64     // Unix nanoseconds
-	specStart   int64     // Unix nanoseconds
-	startTime   time.Time // Reference time for the start of the entire simulation
-	rng         *rand.Rand
-	k           float64
-	scale       float64
+	specs            []LoadSpec
+	currentSpec      int
+	nextEvent        int64     // Unix nanoseconds
+	specStart        int64     // Unix nanoseconds
+	startTime        time.Time // Reference time for the start of the entire simulation
+	rng              *rand.Rand
+	a, b, c          float64 // rational function parameters: y = a + b*x/(1-c*x)
+	interArrivalTime float64 // cached inter-arrival time
 }
 
 // NewLoadGenerator creates a new load generator from an array of LoadSpecs
@@ -88,19 +87,40 @@ func NewLoadGenerator(specs []LoadSpec) *LoadGenerator {
 	startTime := now.Add(-time.Duration(totalDurationNano))
 	startNano := startTime.UnixNano()
 
-	p50 := specs[0].P50LatencyMS
-	p99 := specs[0].P99LatencyMS
-
-	return &LoadGenerator{
+	lg := &LoadGenerator{
 		specs:       specs,
 		currentSpec: 0,
 		nextEvent:   startNano,
 		specStart:   startNano,
 		startTime:   startTime,
 		rng:         rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(now.UnixNano()>>32))),
-		k:           math.Log(2*p99/p50-1) / math.Log(0.99/0.5),
-		scale:       0.5 * p50,
 	}
+
+	lg.updateDistParams(specs[0])
+	return lg
+}
+
+// updateDistParams calculates rational function parameters from p50 and p99
+// Solves the system:
+//   y = a + b*x/(1-c*x)
+//   x=0    → y = p50/2
+//   x=0.5  → y = p50
+//   x=0.99 → y = p99
+func (lg *LoadGenerator) updateDistParams(spec LoadSpec) {
+	lg.interArrivalTime = (60.0 * 1e9) / float64(spec.RPM)
+
+	p50 := spec.P50LatencyMS
+	p99 := spec.P99LatencyMS
+
+	// From constraint 1: a = p50/2
+	lg.a = p50 / 2
+
+	// From constraint 2 and 3, solve for c:
+	// c = (1.49*p50 - p99) / (0.99*(p50 - p99))
+	lg.c = (1.49*p50 - p99) / (0.99 * (p50 - p99))
+
+	// From constraint 2, solve for b:
+	lg.b = p50 * (1 - 0.5*lg.c)
 }
 
 // Next returns the next load event, or false if all specs are exhausted
@@ -120,21 +140,33 @@ func (lg *LoadGenerator) Next() (LoadEvent, bool) {
 		}
 		lg.specStart = lg.nextEvent
 		spec = lg.specs[lg.currentSpec]
-		lg.k = math.Log(2*spec.P99LatencyMS/spec.P50LatencyMS-1) / math.Log(0.99/0.5)
-		lg.scale = 0.5 * spec.P50LatencyMS
+		lg.updateDistParams(spec)
 	}
 
 	// Current event timestamp
 	timestamp := lg.nextEvent
 
 	// Calculate inter-arrival time based on RPM (exponential distribution)
-	interArrival := (60.0 * 1e9) / float64(spec.RPM)
-	nextInterval := lg.rng.ExpFloat64() * interArrival
+	nextInterval := lg.rng.ExpFloat64() * lg.interArrivalTime
 	lg.nextEvent += int64(nextInterval)
 
-	// Generate response duration using power-law distribution
+	// Generate response duration using piecewise function:
+	// - For x <= 0.99: rational function y = a + b*x/(1-c*x)
+	// - For x > 0.99: linear from P99 to timeout (heavy tail)
 	x := lg.rng.Float64()
-	t_delta := lg.scale * (1 + math.Exp(lg.k*(math.Log(x)-logHalf)))
+	var t_delta float64
+
+	if x <= 0.99 {
+		// Rational function for main distribution
+		t_delta = lg.a + lg.b*x/(1-lg.c*x)
+	} else {
+		// Linear tail from P99 (at x=0.99) to timeout (at x=1.0)
+		// slope = (timeout - p99) / (1.0 - 0.99) = (timeout - p99) / 0.01
+		p99 := spec.P99LatencyMS
+		maxValue := spec.TimeoutMS
+		slope := (maxValue - p99) / 0.01
+		t_delta = p99 + slope*(x-0.99)
+	}
 
 	// Determine success based on error rate
 	success := lg.rng.Float64() >= spec.ErrorRate
@@ -363,6 +395,3 @@ func (es *EventStream) Next() (SimEvent, error) {
 		}
 	}
 }
-
-// Optimisations
-const logHalf = -0.6931471805599453
