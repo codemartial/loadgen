@@ -63,6 +63,11 @@ type LoadGenerator struct {
 
 // NewLoadGenerator creates a new load generator from an array of LoadSpecs
 func NewLoadGenerator(specs []LoadSpec) *LoadGenerator {
+	return NewLoadGeneratorWithSeed(specs, uint64(time.Now().UnixNano()))
+}
+
+// NewLoadGeneratorWithSeed creates a new load generator with a specific RNG seed for deterministic output
+func NewLoadGeneratorWithSeed(specs []LoadSpec, seed uint64) *LoadGenerator {
 	if len(specs) == 0 {
 		panic(fmt.Sprintf("No load specifications provided"))
 	}
@@ -93,7 +98,7 @@ func NewLoadGenerator(specs []LoadSpec) *LoadGenerator {
 		nextEvent:   startNano,
 		specStart:   startNano,
 		startTime:   startTime,
-		rng:         rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(now.UnixNano()>>32))),
+		rng:         rand.New(rand.NewPCG(seed, seed>>32)),
 	}
 
 	lg.updateDistParams(specs[0])
